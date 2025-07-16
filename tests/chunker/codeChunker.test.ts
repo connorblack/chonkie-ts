@@ -237,4 +237,153 @@ print(f"Factorial of 5 is {result}")
     expect(normalizeText(reconstructedText)).toEqual(normalizeText(samplePythonCode));
   });
 
+  describe('WASM file resolution', () => {
+    // Store the original require.resolve to restore it later
+    const originalResolve = require.resolve;
+    
+    afterEach(() => {
+      // Restore original require.resolve after each test
+      require.resolve = originalResolve;
+    });
+
+    it('should use require.resolve when successful', async () => {
+      // Mock require.resolve to return a valid path
+      const mockWasmPath = '/mock/path/to/tree-sitter-javascript.wasm';
+      const mockFs = jest.createMockFromModule('fs') as any;
+      mockFs.readFileSync = jest.fn().mockReturnValue(Buffer.from('mock-wasm-content'));
+      
+      // Mock require.resolve to succeed
+      require.resolve = jest.fn().mockReturnValue(mockWasmPath);
+      
+      // Mock file system operations
+      const fs = require('fs');
+      const originalReadFileSync = fs.readFileSync;
+      fs.readFileSync = mockFs.readFileSync;
+      
+      try {
+        const chunker = await CodeChunker.create({ tokenizer: 'Xenova/gpt2', lang: 'javascript' });
+        await chunker.chunk('const x = 1;');
+        
+        // Verify require.resolve was called with correct parameters
+        expect(require.resolve).toHaveBeenCalledWith(
+          'tree-sitter-wasms/out/tree-sitter-javascript.wasm',
+          { paths: [expect.any(String)] }
+        );
+      } finally {
+        // Restore original fs.readFileSync
+        fs.readFileSync = originalReadFileSync;
+      }
+    });
+
+    it('should fallback to manual node_modules search when require.resolve fails', async () => {
+      // Mock require.resolve to throw an error
+      require.resolve = jest.fn().mockImplementation(() => {
+        throw new Error('Module not found');
+      });
+      
+      // Mock the findNearestNodeModules to return a valid path
+      const mockNodeModulesPath = '/mock/node_modules';
+      const originalFindNearestNodeModules = (CodeChunker as any).findNearestNodeModules;
+      (CodeChunker as any).findNearestNodeModules = jest.fn().mockReturnValue(mockNodeModulesPath);
+      
+      // Mock fs operations
+      const fs = require('fs');
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+      fs.existsSync = jest.fn().mockReturnValue(true);
+      fs.readFileSync = jest.fn().mockReturnValue(Buffer.from('mock-wasm-content'));
+      
+      try {
+        const chunker = await CodeChunker.create({ tokenizer: 'Xenova/gpt2', lang: 'javascript' });
+        await chunker.chunk('const x = 1;');
+        
+        // Verify fallback was used
+        expect(require.resolve).toHaveBeenCalled();
+        expect((CodeChunker as any).findNearestNodeModules).toHaveBeenCalled();
+        expect(fs.existsSync).toHaveBeenCalledWith(
+          expect.stringContaining('tree-sitter-javascript.wasm')
+        );
+      } finally {
+        // Restore original functions
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        (CodeChunker as any).findNearestNodeModules = originalFindNearestNodeModules;
+      }
+    });
+
+    it('should throw error when tree-sitter-wasms package not found', async () => {
+      // Mock require.resolve to fail
+      require.resolve = jest.fn().mockImplementation(() => {
+        throw new Error('Module not found');
+      });
+      
+      // Mock findNearestNodeModules to return null (no node_modules found)
+      const originalFindNearestNodeModules = (CodeChunker as any).findNearestNodeModules;
+      (CodeChunker as any).findNearestNodeModules = jest.fn().mockReturnValue(null);
+      
+      try {
+        const chunker = await CodeChunker.create({ tokenizer: 'Xenova/gpt2', lang: 'javascript' });
+        await expect(chunker.chunk('const x = 1;')).rejects.toThrow(
+          'Tree-sitter-wasms package not found. This is required for loading tree-sitter language WASM files.'
+        );
+      } finally {
+        // Restore original function
+        (CodeChunker as any).findNearestNodeModules = originalFindNearestNodeModules;
+      }
+    });
+
+    it('should throw error when WASM file not found in fallback path', async () => {
+      // Mock require.resolve to fail
+      require.resolve = jest.fn().mockImplementation(() => {
+        throw new Error('Module not found');
+      });
+      
+      // Mock findNearestNodeModules to return a valid path
+      const mockNodeModulesPath = '/mock/node_modules';
+      const originalFindNearestNodeModules = (CodeChunker as any).findNearestNodeModules;
+      (CodeChunker as any).findNearestNodeModules = jest.fn().mockReturnValue(mockNodeModulesPath);
+      
+      // Mock fs.existsSync to return false (file not found)
+      const fs = require('fs');
+      const originalExistsSync = fs.existsSync;
+      fs.existsSync = jest.fn().mockReturnValue(false);
+      
+      try {
+        const chunker = await CodeChunker.create({ tokenizer: 'Xenova/gpt2', lang: 'javascript' });
+        await expect(chunker.chunk('const x = 1;')).rejects.toThrow(
+          'Tree-sitter WASM file for language "javascript" not found at'
+        );
+      } finally {
+        // Restore original functions
+        fs.existsSync = originalExistsSync;
+        (CodeChunker as any).findNearestNodeModules = originalFindNearestNodeModules;
+      }
+    });
+
+    it('should handle language name formatting correctly', async () => {
+      // Mock require.resolve to return a valid path
+      const mockWasmPath = '/mock/path/to/tree-sitter-c_sharp.wasm';
+      require.resolve = jest.fn().mockReturnValue(mockWasmPath);
+      
+      // Mock file system operations
+      const fs = require('fs');
+      const originalReadFileSync = fs.readFileSync;
+      fs.readFileSync = jest.fn().mockReturnValue(Buffer.from('mock-wasm-content'));
+      
+      try {
+        const chunker = await CodeChunker.create({ tokenizer: 'Xenova/gpt2', lang: 'c-sharp' });
+        await chunker.chunk('var x = 1;');
+        
+        // Verify require.resolve was called with formatted language name (hyphens replaced with underscores)
+        expect(require.resolve).toHaveBeenCalledWith(
+          'tree-sitter-wasms/out/tree-sitter-c_sharp.wasm',
+          { paths: [expect.any(String)] }
+        );
+      } finally {
+        // Restore original fs.readFileSync
+        fs.readFileSync = originalReadFileSync;
+      }
+    });
+  });
+
 });
