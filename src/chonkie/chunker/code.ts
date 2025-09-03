@@ -142,6 +142,15 @@ export class CodeChunker extends BaseChunker {
   }
 
   /**
+   * Wrapper around require.resolve to make it mockable in tests.
+   * This abstraction allows tests to simulate resolution failures and
+   * fallback behaviour while production code uses Node.js resolution.
+   */
+  private static resolveModule(modulePath: string, options?: { paths?: string[] }): string {
+    return require.resolve(modulePath, options);
+  }
+
+  /**
    * Initialize the tree-sitter parser for the given language using WASM.
    */
   private async _initParser(lang: string): Promise<void> {
@@ -155,23 +164,30 @@ export class CodeChunker extends BaseChunker {
     // Convert language name to lowercase and replace hyphens with underscores
     const formattedLang = lang.toLowerCase().replace(/-/g, '_');
 
-    // Find node_modules starting from the current file's directory and searching upwards
-    const nodeModulesPath = CodeChunker.findNearestNodeModules(__dirname);
-
-    if (!nodeModulesPath) {
-      throw new Error(
-        "node_modules directory not found. " +
-        "This is required for loading tree-sitter language WASM files from 'tree-sitter-wasms' package."
-      );
-    }
-
-    const wasmPath = path.join(nodeModulesPath, `tree-sitter-wasms/out/tree-sitter-${formattedLang}.wasm`);
-
-    if (!fs.existsSync(wasmPath)) {
-      throw new Error(
-        `Tree-sitter WASM file for language "${formattedLang}" not found at ${wasmPath}. ` +
-        `Ensure 'tree-sitter-wasms' package is installed and the language is supported.`
-      );
+    // Attempt to resolve the WASM file using Node.js module resolution first.
+    // This supports hoisted dependencies in monorepos and different package managers.
+    const wasmSubpath = `tree-sitter-wasms/out/tree-sitter-${formattedLang}.wasm`;
+    let wasmPath: string;
+    try {
+      wasmPath = CodeChunker.resolveModule(wasmSubpath, { paths: [__dirname] });
+    } catch (err: any) {
+      if (err && err.code !== 'MODULE_NOT_FOUND') {
+        throw err;
+      }
+      // Fallback: traverse upwards to find nearest node_modules and build the path
+      const nodeModulesPath = CodeChunker.findNearestNodeModules(__dirname);
+      if (!nodeModulesPath) {
+        throw new Error(
+          "Tree-sitter-wasms package not found. This is required for loading tree-sitter language WASM files."
+        );
+      }
+      wasmPath = path.join(nodeModulesPath, wasmSubpath);
+      if (!fs.existsSync(wasmPath)) {
+        throw new Error(
+          `Tree-sitter WASM file for language "${formattedLang}" not found at ${wasmPath}. ` +
+          `Ensure 'tree-sitter-wasms' package is installed and the language is supported.`
+        );
+      }
     }
 
     try {
@@ -424,7 +440,7 @@ export class CodeChunker extends BaseChunker {
    * Return a string representation of the CodeChunker.
    */
   public toString(): string {
-    return `CodeChunker(tokenizer=${this.tokenizer}, ` +
+    return `CodeChunker(tokenizer=${(this.tokenizer as any).backend ?? this.tokenizer}, ` +
       `chunkSize=${this.chunkSize}, ` +
       `lang=${this.lang}, ` +
       `includeNodes=${this.includeNodes})`;
