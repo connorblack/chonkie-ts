@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { CodeChunker, CodeChunkerOptions } from '../../src/chonkie/chunker/code';
 import { CodeChunk } from '../../src/chonkie/types/code';
 
@@ -237,4 +238,63 @@ print(f"Factorial of 5 is {result}")
     expect(normalizeText(reconstructedText)).toEqual(normalizeText(samplePythonCode));
   });
 
+  describe('WASM file resolution', () => {
+    beforeAll(() => {
+      // Clear caches to ensure tests don't interfere with each other
+      (CodeChunker as any).formattedLangCache?.clear?.();
+      (CodeChunker as any).wasmPathCache?.clear?.();
+    });
+
+    afterEach(() => {
+      // Restore original implementations so spies do not leak between tests
+      jest.restoreAllMocks();
+      // Clear caches between tests to ensure isolation
+      (CodeChunker as any).formattedLangCache?.clear?.();
+      (CodeChunker as any).wasmPathCache?.clear?.();
+    });
+
+    it('should use fallback when require.resolve fails and find wasm file', async () => {
+      jest.spyOn(CodeChunker as any, 'resolveModule').mockImplementation(() => {
+        const error = new Error() as any;
+        error.code = 'MODULE_NOT_FOUND';
+        throw error;
+      });
+
+      const chunker = await CodeChunker.create({ lang: 'javascript', tokenizer: 'Xenova/gpt2' });
+      await expect(chunker.chunk('const a = 1;')).resolves.toBeDefined();
+    });
+
+    it('should throw error if require.resolve fails and tree-sitter-wasms is not found', async () => {
+      jest.spyOn(CodeChunker as any, 'resolveModule').mockImplementation(() => {
+        const error = new Error() as any;
+        error.code = 'MODULE_NOT_FOUND';
+        throw error;
+      });
+      jest.spyOn(CodeChunker as any, 'findNearestNodeModules').mockReturnValue(null);
+
+      const chunkerPromise = (await CodeChunker.create({ lang: 'javascript', tokenizer: 'Xenova/gpt2' })).chunk('const a = 1;');
+      await expect(chunkerPromise).rejects.toThrow(
+        'Tree-sitter-wasms package not found. This is required for loading tree-sitter language WASM files.'
+      );
+    });
+
+    it('should throw error if require.resolve fails and wasm file does not exist in fallback path', async () => {
+      jest.spyOn(CodeChunker as any, 'resolveModule').mockImplementation(() => {
+        const error = new Error() as any;
+        error.code = 'MODULE_NOT_FOUND';
+        throw error;
+      });
+      const mockNodeModules = '/tmp/node_modules';
+      jest.spyOn(CodeChunker as any, 'findNearestNodeModules').mockReturnValue(mockNodeModules);
+      jest.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+      const chunkerPromise = (await CodeChunker.create({ lang: 'javascript', tokenizer: 'Xenova/gpt2' })).chunk('const a = 1;');
+      await expect(chunkerPromise).rejects.toThrow(/Tree-sitter WASM file for language "javascript" not found at/);
+    });
+
+    it('should use require.resolve path when WASM file is found without fallback', async () => {
+      const chunker = await CodeChunker.create({ lang: 'javascript', tokenizer: 'Xenova/gpt2' });
+      await expect(chunker.chunk('const a = 1;')).resolves.toBeDefined();
+    });
+  });
 });
