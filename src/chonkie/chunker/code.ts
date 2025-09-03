@@ -40,6 +40,10 @@ export class CodeChunker extends BaseChunker {
   private language: Language | undefined = undefined;
   private static treeSitterInitialized = false;
 
+  // Performance caches shared across instances
+  private static readonly formattedLangCache = new Map<string, string>();
+  private static readonly wasmPathCache = new Map<string, string>();
+
   /**
    * Private constructor. Use `CodeChunker.create()` to instantiate.
    */
@@ -151,6 +155,18 @@ export class CodeChunker extends BaseChunker {
   }
 
   /**
+   * Get formatted language name with caching to avoid repeated string ops.
+   * Tree-sitter WASM files use lowercase with underscores (e.g., c-sharp -> c_sharp)
+   */
+  private static getFormattedLang(lang: string): string {
+    const cached = this.formattedLangCache.get(lang);
+    if (cached) return cached;
+    const formatted = lang.toLowerCase().replace(/-/g, "_");
+    this.formattedLangCache.set(lang, formatted);
+    return formatted;
+  }
+
+  /**
    * Initialize the tree-sitter parser for the given language using WASM.
    */
   private async _initParser(lang: string): Promise<void> {
@@ -161,33 +177,38 @@ export class CodeChunker extends BaseChunker {
     // Parser.init() is now called in the static create method
     // and treeSitterInitialized is managed there.
 
-    // Convert language name to lowercase and replace hyphens with underscores
-    const formattedLang = lang.toLowerCase().replace(/-/g, '_');
+    // Convert language name into the WASM filename format
+    const formattedLang = CodeChunker.getFormattedLang(lang);
 
-    // Attempt to resolve the WASM file using Node.js module resolution first.
-    // This supports hoisted dependencies in monorepos and different package managers.
+    // Attempt to resolve with Node.js module resolution first; fallback to nearest node_modules
     const wasmSubpath = `tree-sitter-wasms/out/tree-sitter-${formattedLang}.wasm`;
     let wasmPath: string;
-    try {
-      wasmPath = CodeChunker.resolveModule(wasmSubpath, { paths: [__dirname] });
-    } catch (err: any) {
-      if (err && err.code !== 'MODULE_NOT_FOUND') {
-        throw err;
+
+    const cachedPath = CodeChunker.wasmPathCache.get(lang);
+    if (cachedPath) {
+      wasmPath = cachedPath;
+    } else {
+      try {
+        wasmPath = CodeChunker.resolveModule(wasmSubpath, { paths: [__dirname] });
+      } catch (err: any) {
+        if (err && err.code !== 'MODULE_NOT_FOUND') {
+          throw err;
+        }
+        const nodeModulesPath = CodeChunker.findNearestNodeModules(__dirname);
+        if (!nodeModulesPath) {
+          throw new Error(
+            "Tree-sitter-wasms package not found. This is required for loading tree-sitter language WASM files."
+          );
+        }
+        wasmPath = path.join(nodeModulesPath, wasmSubpath);
+        if (!fs.existsSync(wasmPath)) {
+          throw new Error(
+            `Tree-sitter WASM file for language "${formattedLang}" not found at ${wasmPath}. ` +
+            `Ensure 'tree-sitter-wasms' package is installed and the language is supported.`
+          );
+        }
       }
-      // Fallback: traverse upwards to find nearest node_modules and build the path
-      const nodeModulesPath = CodeChunker.findNearestNodeModules(__dirname);
-      if (!nodeModulesPath) {
-        throw new Error(
-          "Tree-sitter-wasms package not found. This is required for loading tree-sitter language WASM files."
-        );
-      }
-      wasmPath = path.join(nodeModulesPath, wasmSubpath);
-      if (!fs.existsSync(wasmPath)) {
-        throw new Error(
-          `Tree-sitter WASM file for language "${formattedLang}" not found at ${wasmPath}. ` +
-          `Ensure 'tree-sitter-wasms' package is installed and the language is supported.`
-        );
-      }
+      CodeChunker.wasmPathCache.set(lang, wasmPath);
     }
 
     try {
@@ -214,8 +235,19 @@ export class CodeChunker extends BaseChunker {
    * Group child nodes based on their token counts.
    */
   private async _groupChildNodes(node: TreeSitterNode): Promise<[TreeSitterNode[][], number[]]> {
-    if (!node.children || node.children.length === 0) {
+    // Early return for nodes without children
+    if (!node.children?.length) {
       return [[], []];
+    }
+
+    // Fast path for single child
+    if (node.children.length === 1) {
+      const child = node.children[0];
+      const tokenCount = await this.tokenizer.countTokens(child.text);
+      if (tokenCount <= this.chunkSize) {
+        return [[[child]], [tokenCount]];
+      }
+      return await this._groupChildNodes(child);
     }
 
     const nodeGroups: TreeSitterNode[][] = [];
@@ -223,9 +255,13 @@ export class CodeChunker extends BaseChunker {
     let currentTokenCount = 0;
     let currentNodeGroup: TreeSitterNode[] = [];
 
-    for (const child of node.children) {
-      const childText = child.text;
-      const tokenCount = await this.tokenizer.countTokens(childText);
+    // Batch token counting to reduce tokenizer calls
+    const childTexts = node.children.map((c) => c.text);
+    const tokenCounts = await this.tokenizer.countTokensBatch(childTexts);
+
+    for (let i = 0; i < node.children.length; i++) {
+      const child = node.children[i];
+      const tokenCount = tokenCounts[i];
 
       if (tokenCount > this.chunkSize) {
         if (currentNodeGroup.length > 0) {
@@ -341,7 +377,8 @@ export class CodeChunker extends BaseChunker {
       }
 
       try {
-        const chunkBytes = originalTextBytes.slice(startByte, endByte);
+        // Use subarray to avoid copying
+        const chunkBytes = originalTextBytes.subarray(startByte, endByte);
         const text = chunkBytes.toString('utf-8');
         chunkTexts.push(text);
       } catch (error) {
@@ -352,14 +389,14 @@ export class CodeChunker extends BaseChunker {
 
     // Add any missing bytes at the start and end
     if (nodeGroups[0]?.[0]?.startIndex > 0) {
-      const initialBytes = originalTextBytes.slice(0, nodeGroups[0][0].startIndex);
-      chunkTexts[0] = initialBytes.toString('utf-8') + chunkTexts[0];
+      const initialBytes = originalTextBytes.subarray(0, nodeGroups[0][0].startIndex);
+      chunkTexts[0] = [initialBytes.toString('utf-8'), chunkTexts[0]].join('');
     }
 
     const lastGroup = nodeGroups[nodeGroups.length - 1];
     if (lastGroup?.[lastGroup.length - 1]?.endIndex < originalTextBytes.length) {
-      const remainingBytes = originalTextBytes.slice(lastGroup[lastGroup.length - 1].endIndex);
-      chunkTexts[chunkTexts.length - 1] += remainingBytes.toString('utf-8');
+      const remainingBytes = originalTextBytes.subarray(lastGroup[lastGroup.length - 1].endIndex);
+      chunkTexts[chunkTexts.length - 1] = [chunkTexts[chunkTexts.length - 1], remainingBytes.toString('utf-8')].join('');
     }
 
     return chunkTexts;
@@ -373,7 +410,8 @@ export class CodeChunker extends BaseChunker {
     tokenCounts: number[],
     nodeGroups: TreeSitterNode[][]
   ): CodeChunk[] {
-    const chunks: CodeChunk[] = [];
+    // Pre-allocate array for performance
+    const chunks: CodeChunk[] = new Array(texts.length);
     let currentIndex = 0;
 
     for (let i = 0; i < texts.length; i++) {
@@ -381,14 +419,14 @@ export class CodeChunker extends BaseChunker {
       const tokenCount = tokenCounts[i];
       const nodeGroup = this.includeNodes ? nodeGroups[i] : undefined;
 
-      chunks.push(new CodeChunk({
+      chunks[i] = new CodeChunk({
         text,
         startIndex: currentIndex,
         endIndex: currentIndex + text.length,
         tokenCount,
         lang: this.lang,
         nodes: nodeGroup
-      }));
+      });
 
       currentIndex += text.length;
     }
@@ -440,7 +478,7 @@ export class CodeChunker extends BaseChunker {
    * Return a string representation of the CodeChunker.
    */
   public toString(): string {
-    return `CodeChunker(tokenizer=${(this.tokenizer as any).backend ?? this.tokenizer}, ` +
+    return `CodeChunker(tokenizer=${this.tokenizer.backend}, ` +
       `chunkSize=${this.chunkSize}, ` +
       `lang=${this.lang}, ` +
       `includeNodes=${this.includeNodes})`;

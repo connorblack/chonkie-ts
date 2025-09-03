@@ -62,9 +62,9 @@ export abstract class BaseChunker {
     showProgress: boolean = false
   ): Promise<Chunk[] | Chunk[][]> {
     if (typeof textOrTexts === 'string') {
-      return this.chunk(textOrTexts) as Promise<Chunk[]>;
+      return this.chunk(textOrTexts);
     } else if (Array.isArray(textOrTexts)) {
-      return this.chunkBatch(textOrTexts, showProgress) as Promise<Chunk[][]>;
+      return this.chunkBatch(textOrTexts, showProgress);
     } else {
       // This case should ideally not be reached due to TypeScript's type checking
       // if the public overloads are used correctly.
@@ -163,7 +163,7 @@ export abstract class BaseChunker {
     }
     // If only one text, process it directly without batch overhead, progress not shown for single item.
     if (texts.length === 1) {
-      return [await this.chunk(texts[0]) as Chunk[] ];
+      return [await this.chunk(texts[0]) ];
     }
 
     // For multiple texts, use selected batch processing strategy
